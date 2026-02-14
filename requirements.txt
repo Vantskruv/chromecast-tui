@@ -1,6 +1,6 @@
 # requirements.txt
-mutagen
-pychromecast
+mutagen==1.47.0
+pychromecast==13.1.0
 
 # Current pychromecast requirements
 # protobuf

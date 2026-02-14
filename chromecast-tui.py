@@ -216,7 +216,7 @@ class CastPlayer:
             # Spooky, status.duration seems to work sometimes, if it fails
             # use the preinitialized self.duration value from when after
             # we loaded the file.
-            self.duration = float(status.duration or self.duration) 
+            #self.duration = float(status.duration or self.duration) 
             self.elapsed = float(status.current_time or -1)
 
     # ------------------------------------------------------------------

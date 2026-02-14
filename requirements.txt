@@ -1,0 +1,7 @@
+# requirements.txt
+mutagen
+pychromecast
+
+# Current pychromecast requirements
+# protobuf
+# zeroconf

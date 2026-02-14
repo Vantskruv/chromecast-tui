@@ -13,6 +13,6 @@ Requirements (can be installed with pip):
   *  mutagen [https://github.com/quodlibet/mutagen]
   *  pychromecast [https://github.com/home-assistant-libs/pychromecast]  
 
-Usage:  `chromecast-tui.py -h] ] [--port PORT] [--chromecast-name CAST_NAME] [--chromecast-ip CAST_IP] `  
+Usage:  `chromecast-tui.py [-h] ] [--port PORT] [--chromecast-name CAST_NAME] [--chromecast-ip CAST_IP] `  
 All options are optional.
 

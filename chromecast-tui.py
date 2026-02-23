@@ -2,30 +2,65 @@ import os
 import sys
 import socket
 import threading
+import zeroconf
+import queue
 import random
 import time
 import logging
 import argparse
+
+from collections import deque # Pop and push last songs played
+
+import curses  # standard‑library “curses” UI
 from dataclasses import dataclass
 from mutagen import File as MutagenFile # pip install mutagen
 from mutagen import MutagenError
 from pathlib import Path
-import curses  # standard‑library “curses” UI
 import pychromecast
 from pychromecast.controllers import media
 
+browser = None
+#logging.basicConfig(filename='myapp.log', level=logging.INFO)
+#logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-#import ffmpeg
-
-#def get_duration_from_file_ffprobe(path: str) -> float:
-#    """Return duration (seconds) using ffprobe; requires ffprobe in PATH."""
-#    probe = ffmpeg.probe(path)
-#    format_info = probe.get("format", {})
-#    return float(format_info.get("duration", 0))
 
 SUPPORTED_EXTENSIONS = {
     ".mp3", ".aac", ".m4a", ".wav", ".flac", ".ogg", ".opus"
 }
+
+
+class ChromecastListener(pychromecast.discovery.AbstractCastListener):
+    """Listener for discovering chromecasts."""
+    def __init__(self):
+        self.browser: CastBrowser = None
+        self.services = None
+        self._lock = threading.Lock()
+        
+    def add_cast(self, uuid: UUID, service: str) -> None:
+        """Called when a new cast has beeen discovered."""
+        with self._lock:
+            self.services = list(self.browser.services.values())
+
+    def remove_cast(self, uuid: UUID, service: str, cast_info: CastInfo) -> None:
+        """Called when a cast has beeen lost (MDNS info expired or host down)."""
+        with self._lock:
+            self.services = list(self.browser.services.values())
+
+    def update_cast(self, uuid: UUID, service: str) -> None:
+        """Called when a cast has beeen updated (MDNS info renewed or changed)."""
+        with self._lock:
+            self.services = list(self.browser.services.values())
+
+# Custom notification handler
+class UINotificationHandler(logging.Handler):
+    def __init__(self, q: queue.Queue):
+        super().__init__()
+        self.q = q
+
+    def emit(self, record):
+        msg = self.format(record)
+        self.q.put(msg)
+
 
 def get_duration_from_file(path: str) -> float:
     """
@@ -79,64 +114,8 @@ def get_local_ip() -> str:
         logger.warning("Failed to determine local IP; using 127.0.0.1")
         return "127.0.0.1"
 
-@dataclass(frozen=True)
-class CastInfo:
-    """Immutable metadata about a discovered Chromecast."""
-    cast: pychromecast.Chromecast
-    name: str
-    ip: str
-    port: int
-
-def discover_chromecast(name_filter: Optional[str] = None, 
-                        ip_filter: Optional[str] = None,
-                        port_filter: Optional[int] = None) -> CastInfo:
-    chromecasts, _ = pychromecast.get_chromecasts()
-
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        logger.info(f"Discovering Chromecast (attempt {attempt}/{max_retries})...")
-        try:
-            chromecasts, _ = pychromecast.get_chromecasts()
-        except Exception as e:
-            logger.warning(f"Discovery failed (retrying): {e}")
-            time.sleep(2)
-            continue
-
-        for cast in chromecasts:
-            try:
-                cast_info = getattr(cast, "cast_info", None)
-                if cast_info == None:
-                    continue
-
-                name = getattr(cast_info, "friendly_name", None)
-                ip = getattr(cast_info, "host", None)
-                port = getattr(cast_info, "port", None)
-                cast = cast
-                if name_filter and name!=name_filter:
-                    continue
-                if ip_filter and ip!=ip_filter:
-                    continue
-                if port_filter and port!=port_filter:
-                    continue
-                if not all([name, ip, port]):
-                    continue
-            
-                logger.info(f"✅ Discovered: {name} @ {ip}:{port}")
-                return CastInfo(cast, name, ip, port)
-            except Exception as e:
-                logger.warning(f"Error processing cast: {e}")
-                continue
-
-        logger.warning("No matching chromecast found. Retrying ...")
-        time.sleep(3)
-
-    raise ValueError(
-        "❌ Failed to find a matching Chromecast device. "
-        "Ensure it's on the same network and not blocked by firewall."
-    )
-
 # ----------------------------------------------------------------------
-# 4️⃣  Tiny HTTP server (daemon thread)
+# Tiny HTTP server (daemon thread)
 # ----------------------------------------------------------------------
 def start_http_server(root: Path, port: int):
     """Serve *root* via SimpleHTTPRequestHandler on *port*."""
@@ -181,7 +160,7 @@ class _StatusListener:
         self._player._handle_status_change(status)
 
 # ----------------------------------------------------------------------
-# 6️⃣  Chromecast wrapper – playback, status listener and UI‑friendly API
+# CastPlayer – playback, status listener
 # ----------------------------------------------------------------------
 class CastPlayer:
     """
@@ -194,6 +173,7 @@ class CastPlayer:
     """
     def __init__(
         self,
+        cast: pychromecast.ChromeCast,
         cast_info: CastInfo,
         music_files: List[Path],
         music_root: Path,
@@ -201,9 +181,11 @@ class CastPlayer:
         http_port: int,
         retry_delay: float = 2.0,
     ):
+        self.cast = cast
         self.cast_info = cast_info
-        self.cast = cast_info.cast
         self.music_files = music_files
+        self.unplayed_files = []
+        self.three_last_played_files = deque()
         self.music_root = music_root
         self.local_ip = local_ip
         self.http_port = http_port
@@ -220,6 +202,7 @@ class CastPlayer:
         self.elapsed: float = 0.0   # seconds
         self.duration: float = 0.0  # seconds (0 means unknown)
 
+
     def __enter__(self):
         self._connect()
         return self
@@ -230,12 +213,12 @@ class CastPlayer:
         return False
 
     def _connect(self):
-        logger.info(f"Connecting to '{self.cast_info.name}'...")
+        logger.info(f"Connecting to '{self.cast_info.friendly_name}'...")
         try:
             self.cast.wait()
             self._mc = self.cast.media_controller
             self._mc.register_status_listener(self._status_listener)
-            logger.info(f"✅ Connected to '{self.cast_info.name}'")
+            logger.info(f"✅ Connected to '{self.cast_info.friendly_name}'")
             self.play_random()
         except Exception as e:
             raise RuntimeError(f"Failed to connect to Chromecast: {e}") from e
@@ -290,13 +273,30 @@ class CastPlayer:
         if len(self.music_files) == 0:
             return
 
-        candidates = [f for f in self.music_files if f!= self.current_path]
-        if not candidates:
-            new_path = random.choice(self.music_files)
-        else:
-            new_path = random.choice(candidates)
+        if len(self.unplayed_files) == 0:
+            self.unplayed_files = self.music_files
 
-        url = self.build_url(new_path, self.music_root)
+        new_path = random.choice(self.unplayed_files)
+        self.unplayed_files.remove(new_path)
+        if len(self.three_last_played_files) > 2:
+            self.three_last_played_files.popright();
+
+        if self.current_path:
+            self.three_last_played_files.appendleft(self.current_path)
+
+
+        #candidates = [f for f in self.music_files if f!= self.current_path]
+        #if not candidates:
+        #    new_path = random.choice(self.music_files)
+        #else:
+        #    new_path = random.choice(candidates)
+
+        try:
+            url = self.build_url(new_path, self.music_root)
+        except ValueError as e:
+            logger.error(f"Failed to build URL for file: {e}")
+            return
+
         mime = guess_mime_type(new_path)
 
         try:
@@ -305,7 +305,7 @@ class CastPlayer:
             logger.error(f"Cannot get duration for {new_path}: {e}")
             return
 
-            # Store the current track info *before* we ask the Cast to play it.
+        # Store the current track info *before* we ask the Cast to play it.
         with self._lock:
             self.current_path = new_path
             self.current_mime = mime
@@ -355,9 +355,9 @@ class CastPlayer:
 # ----------------------------------------------------------------------
 
 # ----------------------------------------------------------------------
-# 7️⃣  Curses UI
+# ChromecastPlayer UI
 # ----------------------------------------------------------------------
-class CursesUI:
+class ChromecastPlayerUI:
     """
     Very small UI that refreshes the screen about 2 times per second
     and reacts to single‑key commands.
@@ -368,7 +368,6 @@ class CursesUI:
         s – stop (go idle)
         q – quit the program
     """
-    HELP_LINES = ["Controls: [n]ext  [p]ause/resume  [s]top  [q]uit",]
 
     def __init__(self, player: CastPlayer, total_tracks: int, music_root):
         self.player = player
@@ -376,6 +375,21 @@ class CursesUI:
         self.music_root = music_root
         self._stop_requested = False
         self.play_next = True # If player is idle and finished, play next random track if true
+        self.HELP_LINES = [
+            "Controls: [n]ext  [p]ause/resume  [s]top  [q]uit",
+            "Last message: ",
+        ]
+
+        # Catching pychromecast log output, which will be presented in the UI (see run function in ChromecastPlayerUI)
+        self.pycc_log_queue = queue.Queue()
+
+        pycc_logger = logging.getLogger("pychromecast")
+        pycc_log_handler = UINotificationHandler(self.pycc_log_queue)
+        pycc_log_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        pycc_logger.addHandler(pycc_log_handler)
+        #pycc_logger.setLevel(logging.WARNING)
+
+
 
     # --------------------------------------------------------------
     #  Helper to draw a simple horizontal progress bar.
@@ -391,13 +405,17 @@ class CursesUI:
     #  Main curses loop – runs until the user presses ‘q’.
     # --------------------------------------------------------------
     def run(self, stdscr):
+
         curses.curs_set(0)                # hide the cursor
         stdscr.nodelay(True)              # getch() is non‑blocking
         stdscr.timeout(1000)              # refresh every 1.0 s
        
-        max_y, max_x = stdscr.getmaxyx()
 
         while not self._stop_requested:
+            while not self.pycc_log_queue.empty():
+                self.HELP_LINES[1] = f"Last message: {self.pycc_log_queue.get_nowait()}"
+
+            max_y, max_x = stdscr.getmaxyx()
             self._draw(stdscr, max_y, max_x)
             self._handle_input(stdscr)
             self.player.poll()
@@ -414,7 +432,7 @@ class CursesUI:
         stdscr.erase()
 
         # ----- Header -------------------------------------------------
-        stdscr.addstr(0, 0, f"📻  Chromecast Terminal Player - {self.player.cast_info.name}", curses.A_BOLD)
+        stdscr.addstr(0, 0, f"📻  Chromecast Terminal Player - {self.player.cast_info.friendly_name}", curses.A_BOLD)
 
         # ----- Current track info ------------------------------------
         with self.player._lock:
@@ -423,6 +441,7 @@ class CursesUI:
             state = self.player.state
             elapsed = self.player.elapsed
             duration = self.player.duration
+            last_played = self.player.three_last_played_files
 
         track_line = "No track playing" if path is None else f"{path.relative_to(self.music_root)}"
         stdscr.addstr(2, 0, f"Track : {track_line}")
@@ -443,7 +462,10 @@ class CursesUI:
         stdscr.addstr(5, 0, f"{bar} {time_str}")
 
         # Library info
-        stdscr.addstr(7, 0, f"Library : {self.total_tracks} tracks")
+        stdscr.addstr(7, 0, f"📂 Library : {self.total_tracks} tracks")
+        stdscr.addstr(8, 0, "Three last played songs:")
+        for i, song in enumerate(last_played, 9):
+            stdscr.addstr(i, 0, f"{song.relative_to(self.music_root)}")
 
         # Help line
         for i, line in enumerate(self.HELP_LINES, start=max_y - 2):
@@ -472,7 +494,82 @@ class CursesUI:
             logger.exception(f"Control error: {e}")
 # ----------------------------------------------------------------------
 
+class SelectCastDeviceUI:
+    def __init__(self):
+        self.current_page = 0
+        self.browser: CastBrowser = None
+        self.cc_listener: ChromecastListener = None
+        self.selected_index = 0
+        self._stop_requested = False
+        self.cast_info = None
+
+    def _try_select(self) -> bool:
+        with self.cc_listener._lock:
+            if self.cc_listener.services == None or self.selected_index >= len(self.cc_listener.services):
+                return False
+            self.cast_info = self.cc_listener.services[self.selected_index]
+            return True
+
+    def run(self, stdscr):
+        zconf = zeroconf.Zeroconf()
+        self.cc_listener = ChromecastListener()
+        self.cc_browser = pychromecast.discovery.CastBrowser(self.cc_listener, zconf)
+        self.cc_listener.browser = self.cc_browser
+        self.cc_browser.start_discovery()
+
+        curses.curs_set(0)                # hide the cursor
+        stdscr.nodelay(True)              # getch() is non‑blocking
+        stdscr.timeout(500)               # refresh every 0.5 s
+
+        while not self._stop_requested:
+            max_y, max_x = stdscr.getmaxyx()
+            self._draw(stdscr, max_y, max_x)
+            self._handle_input(stdscr)
+
+        self.cc_browser.stop_discovery()
+
+    def _draw(self, stdscr, max_y, max_x):
+        stdscr.erase()
+        
+        # ----- Header -------------------------------------------------
+        stdscr.addstr(0, 0, f"📻  Chromecast Terminal Player - Discovering devices", curses.A_BOLD)
+        
+        index = 0
+        with self.cc_listener._lock:
+            if self.cc_listener.services != None:
+                if self.selected_index!=0 and self.selected_index >= len(self.cc_listener.services):
+                    self.selected_index = len(self.cc_listener.services) - 1
+                for service in self.cc_listener.services:
+                    selected_marker = "✅" if index == self.selected_index else " "
+                    stdscr.addstr(index + 2, 0, f"[{selected_marker}] '{service.friendly_name}' ({service.model_name}) @ {service.host}:{service.port}")
+                    index+=1
+
+        #stdscr.addstr(max_y - 2, 0, "Select in page: [0-9]")
+        stdscr.addstr(max_y - 2, 0, " ↑ / ↓ to navigate • ⏎ to select • q[quit]")
+
+        stdscr.refresh()
+
+    def _handle_input(self, stdscr):
+        ch = stdscr.getch()
+        if ch == -1:
+            return  # no key pressed
+        try:
+            if ch == curses.KEY_DOWN:
+                self.selected_index+=1
+            elif ch == curses.KEY_UP:
+                if self.selected_index > 0:
+                    self.selected_index-=1
+            elif ch in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+                self._stop_requested = self._try_select()
+            elif ch == (ord('q') or ord('Q')):
+                self.cast_info = None
+                self._stop_requested = True
+        except Exception as e:
+            logger.exception(f"Control error: {e}")
+
+
 def main():
+   
     parser = argparse.ArgumentParser(
         description="Music player for a Chromecast with a terminal UI."
     )
@@ -488,54 +585,52 @@ def main():
         default=8000,
         help="HTTP port for serving music (default: %(default)s)",
     )
-    parser.add_argument(
-        "--chromecast-name",
-        dest="cast_name",
-        help="Friendly name of the Chromecast (optional)",
-    )
-    parser.add_argument(
-        "--chromecast-ip",
-        dest="cast_ip",
-        help="IP adress of the Chromecast (optional)",
-    )
-    parser.add_argument(
-        "--port-filter",
-        type=int,
-        dest="port_filter",
-        help="Port to filter (e.g., 8009) (optional)",
-    )
+    #parser.add_argument(
+    #    "--chromecast-name",
+    #    dest="cast_name",
+    #    help="Friendly name of the Chromecast (optional)",
+    #)
+    #parser.add_argument(
+    #    "--chromecast-ip",
+    #    dest="cast_ip",
+    #    help="IP adress of the Chromecast (optional)",
+    #)
+    #parser.add_argument(
+    #    "--port-filter",
+    #    type=int,
+    #    dest="port_filter",
+    #    help="Port to filter (e.g., 8009) (optional)",
+    #)
     args = parser.parse_args()
 
+    
     music_root = Path(args.music_dir)
     if not music_root.exists():
         sys.exit(f"❌ Music directory does not exist: {music_root}")
-
     logger.info(f"📂 Scanning {music_root}...")    
     music_files = scan_music(music_root)
     if not music_files:
         sys.exit(f"❌ No supported audio files found in {music_root}")
     print(f"📂 Found {len(music_files)} playable tracks")
 
-    try:
-        cast_info = discover_chromecast(
-                name_filter=args.cast_name, 
-                ip_filter=args.cast_ip,
-                port_filter=args.port_filter
-                )
-    except ValueError as e:
-        sys.exit(str(e))
 
-    print(f"✅ Found Chromecast: {cast_info.name} ({cast_info.ip}:{cast_info.port})")
+    cc_select_ui = SelectCastDeviceUI()
+    curses.wrapper(lambda stdscr: cc_select_ui.run(stdscr))
+    if cc_select_ui.cast_info == None:
+        return
+    cast_info = cc_select_ui.cast_info
+    cast = pychromecast.get_chromecast_from_cast_info(cast_info, zeroconf.Zeroconf())
+    print(f"✅ Found Chromecast: {cast_info.friendly_name} ({cast_info.host}:{cast_info.port})")
 
+    
     server_thread, httpd = start_http_server(music_root, args.port)
 
+    
     local_ip = get_local_ip()
-    with CastPlayer(cast_info, music_files, music_root, local_ip, args.port) as player:
+    with CastPlayer(cast, cast_info, music_files, music_root, local_ip, args.port) as player:
         logger.info("▶️  Starting UI (press 'q' to quit)...")
         try:
-            curses.wrapper(
-                    lambda stdscr: CursesUI(player, len(music_files), music_root).run(stdscr)
-                    )
+            curses.wrapper(lambda stdscr: ChromecastPlayerUI(player, len(music_files), music_root).run(stdscr))
         except KeyboardInterrupt:
             logger.info("\n👋 KeyboardInterrupt detected — exiting cleanly.")
         finally:
